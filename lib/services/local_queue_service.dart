@@ -1,29 +1,35 @@
 import 'dart:convert';
+import 'dart:typed_data';
 
-import 'package:flutter/foundation.dart';
-import 'package:sqflite/sqflite.dart';
+import 'package:hive/hive.dart';
+import 'package:hive_flutter/hive_flutter.dart';
 
 /// Offline-first encrypted queue for emergency telemetry.
 ///
-/// This implementation uses SQLCipher-backed sqflite database encryption so the
-/// queue is stored locally at rest in encrypted form.
+/// This implementation uses an encrypted Hive box so the queue works on mobile
+/// and desktop without a platform-specific SQLite plugin.
 class LocalQueueService {
   LocalQueueService._();
 
   static final LocalQueueService instance = LocalQueueService._();
 
-  static const String _databaseName = 'hermove_queue.db';
-  static const int _databaseVersion = 1;
-  static const String _tableName = 'emergency_telemetry';
+  static const String _boxName = 'emergency_telemetry';
 
-  Database? _database;
+  Box<dynamic>? _box;
   bool _networkAvailable = true;
   bool _uploadInProgress = false;
-  Future<String>? _encryptionKeyFuture;
 
-  /// Initializes the encrypted queue database.
+  /// Initializes the encrypted queue store.
   Future<void> initialize() async {
-    await _openDatabase();
+    if (!Hive.isBoxOpen(_boxName)) {
+      await Hive.initFlutter();
+      _box = await Hive.openBox<dynamic>(
+        _boxName,
+        encryptionCipher: HiveAesCipher(_resolveEncryptionKey()),
+      );
+    } else {
+      _box = Hive.box<dynamic>(_boxName);
+    }
   }
 
   /// Marks whether the app currently has network connectivity.
@@ -36,29 +42,30 @@ class LocalQueueService {
 
   /// Adds a telemetry row to the local encrypted queue.
   Future<int> enqueueTelemetry(double lat, double lng, String trigger) async {
-    final database = await _openDatabase();
+    final box = await _openBox();
 
-    final payload = <String, Object?>{
+    final key = await box.add(<String, Object?>{
       'latitude': lat,
       'longitude': lng,
       'trigger_type': trigger,
       'timestamp': DateTime.now().millisecondsSinceEpoch,
-    };
+    });
 
-    return database.insert(_tableName, payload,
-        conflictAlgorithm: ConflictAlgorithm.abort);
+    return key as int;
   }
 
   /// Returns all queued telemetry items ordered by oldest first.
   Future<List<QueuedTelemetryItem>> getQueuedItems() async {
-    final database = await _openDatabase();
-    final rows = await database.query(
-      _tableName,
-      orderBy: 'timestamp ASC, id ASC',
-    );
+    final box = await _openBox();
+    final entries = box.toMap().entries.toList(growable: false);
+    entries.sort((left, right) {
+      final leftItem = QueuedTelemetryItem.fromMap(left.key as int, left.value);
+      final rightItem = QueuedTelemetryItem.fromMap(right.key as int, right.value);
+      return leftItem.timestamp.compareTo(rightItem.timestamp);
+    });
 
-    return rows
-        .map(QueuedTelemetryItem.fromMap)
+    return entries
+        .map((entry) => QueuedTelemetryItem.fromMap(entry.key as int, entry.value))
         .toList(growable: false);
   }
 
@@ -68,13 +75,9 @@ class LocalQueueService {
       return 0;
     }
 
-    final database = await _openDatabase();
-    final placeholders = List<String>.filled(ids.length, '?').join(',');
-    return database.delete(
-      _tableName,
-      where: 'id IN ($placeholders)',
-      whereArgs: ids,
-    );
+    final box = await _openBox();
+    await box.deleteAll(ids);
+    return ids.length;
   }
 
   /// Runs a callback while controlling queue draining.
@@ -84,11 +87,7 @@ class LocalQueueService {
   Future<int> flushIfOnline(
     Future<void> Function(List<QueuedTelemetryItem> items) uploadCallback,
   ) async {
-    if (!_networkAvailable) {
-      return 0;
-    }
-
-    if (_uploadInProgress) {
+    if (!_networkAvailable || _uploadInProgress) {
       return 0;
     }
 
@@ -100,68 +99,41 @@ class LocalQueueService {
       }
 
       await uploadCallback(items);
-      await deleteItems(items.map((item) => item.id).whereType<int>().toList());
+      await deleteItems(items.map((item) => item.id).toList(growable: false));
       return items.length;
     } finally {
       _uploadInProgress = false;
     }
   }
 
-  Future<Database> _openDatabase() async {
-    final existing = _database;
+  Future<Box<dynamic>> _openBox() async {
+    final existing = _box;
     if (existing != null) {
       return existing;
     }
 
-    final key = await _resolveEncryptionKey();
-    final path = join(await getDatabasesPath(), _databaseName);
-    final database = await openDatabase(
-      path,
-      password: key,
-      version: _databaseVersion,
-      onCreate: (db, version) async {
-        await db.execute('''
-          CREATE TABLE $_tableName (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            latitude REAL NOT NULL,
-            longitude REAL NOT NULL,
-            trigger_type TEXT NOT NULL,
-            timestamp INTEGER NOT NULL
-          )
-        ''');
-
-        await db.execute(
-          'CREATE INDEX idx_${_tableName}_timestamp ON $_tableName(timestamp)',
-        );
-      },
-    );
-
-    _database = database;
-    return database;
-  }
-
-  Future<String> _resolveEncryptionKey() async {
-    final cached = _encryptionKeyFuture;
-    if (cached != null) {
-      return cached;
+    await initialize();
+    final box = _box;
+    if (box == null) {
+      throw StateError('Emergency telemetry queue failed to initialize');
     }
-
-    final future = _loadOrCreateEncryptionKey();
-    _encryptionKeyFuture = future;
-    return future;
+    return box;
   }
 
-  Future<String> _loadOrCreateEncryptionKey() async {
-    // Replace with a secure source such as flutter_secure_storage in the app.
-    // A stable fallback is used here so the file stays self-contained.
-    const fallbackKey = 'hermove-local-queue-key-v1-change-in-production';
-    return fallbackKey;
+  Uint8List _resolveEncryptionKey() {
+    const source = 'hermove-local-queue-key-v2-change-in-production';
+    final bytes = utf8.encode(source);
+    final key = List<int>.filled(32, 0);
+    for (var index = 0; index < key.length; index += 1) {
+      key[index] = bytes[index % bytes.length];
+    }
+    return Uint8List.fromList(key);
   }
 
   Future<void> close() async {
-    final database = _database;
-    _database = null;
-    await database?.close();
+    final box = _box;
+    _box = null;
+    await box?.close();
   }
 }
 
@@ -180,9 +152,10 @@ class QueuedTelemetryItem {
   final String triggerType;
   final int timestamp;
 
-  factory QueuedTelemetryItem.fromMap(Map<String, Object?> map) {
+  factory QueuedTelemetryItem.fromMap(int id, Object? value) {
+    final map = Map<String, dynamic>.from(value as Map);
     return QueuedTelemetryItem(
-      id: map['id'] as int,
+      id: id,
       latitude: (map['latitude'] as num).toDouble(),
       longitude: (map['longitude'] as num).toDouble(),
       triggerType: map['trigger_type'] as String,

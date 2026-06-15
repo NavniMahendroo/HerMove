@@ -135,24 +135,26 @@ class HardwareBridge {
   Future<void> _captureHighGBurst(double magnitude) async {
     final location = await _safeGetLocation();
     final timestamp = DateTime.now().millisecondsSinceEpoch;
+    final latitude = location?.latitude;
+    final longitude = location?.longitude;
 
     final triggerPayload = <String, dynamic>{
       'event': 'high_g_burst',
       'trigger_type': 'high_g_burst',
       'magnitude': magnitude,
       'timestamp': timestamp,
-      if (location != null) 'latitude': location.latitude,
-      if (location != null) 'longitude': location.longitude,
+      if (latitude != null) 'latitude': latitude,
+      if (longitude != null) 'longitude': longitude,
       if (location != null) 'accuracy': location.accuracy,
       if (location != null) 'altitude': location.altitude,
     };
 
     _emitAlert(triggerPayload);
 
-    if (location != null) {
+    if (latitude != null && longitude != null) {
       await LocalQueueService.instance.enqueueTelemetry(
-        location.latitude,
-        location.longitude,
+        latitude,
+        longitude,
         'high_g_burst',
       );
     }
